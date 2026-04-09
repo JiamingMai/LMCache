@@ -7,22 +7,92 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <cstring>            // for strerror
+#include <mutex>
+#include <unordered_map>
 #include <linux/mempolicy.h>  // for MPOL_BIND, MPOL_MF_MOVE, MPOL_MF_STRICT
 #include "mem_alloc.h"
+
+// Track allocations that used the mmap + cudaHostRegister fallback path
+// so free_pinned_ptr can choose the correct deallocation method.
+static std::mutex g_fallback_mtx;
+static std::unordered_map<uintptr_t, size_t> g_fallback_allocs;
 
 uintptr_t alloc_pinned_ptr(size_t size, unsigned int flags) {
   void* ptr = nullptr;
   cudaError_t err = cudaHostAlloc(&ptr, size, flags);
-  if (err != cudaSuccess) {
-    throw std::runtime_error("cudaHostAlloc failed: " + std::to_string(err));
+  if (err == cudaSuccess) {
+    return reinterpret_cast<uintptr_t>(ptr);
   }
-  return reinterpret_cast<uintptr_t>(ptr);
+
+  // cudaHostAlloc can fail on certain GPU architectures (e.g. Blackwell)
+  // or driver configurations.  Clear the error state and fall back to
+  // mmap + cudaHostRegister, which produces equivalent pinned memory.
+  (void)cudaGetLastError();
+
+  ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (ptr == MAP_FAILED) {
+    throw std::runtime_error(std::string("alloc_pinned_ptr mmap failed: ") +
+                             strerror(errno));
+  }
+
+  // Force physical page allocation so cudaHostRegister can pin them.
+  const long ps = sysconf(_SC_PAGESIZE);
+  for (size_t off = 0; off < size; off += ps) {
+    volatile char* c = static_cast<volatile char*>(ptr) + off;
+    *c = 0;
+  }
+
+  err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
+  if (err != cudaSuccess) {
+    (void)cudaGetLastError();
+    munmap(ptr, size);
+    throw std::runtime_error(
+        std::string("alloc_pinned_ptr cudaHostRegister failed: ") +
+        cudaGetErrorString(err));
+  }
+
+  uintptr_t result = reinterpret_cast<uintptr_t>(ptr);
+  {
+    std::lock_guard<std::mutex> lk(g_fallback_mtx);
+    g_fallback_allocs[result] = size;
+  }
+  return result;
 }
 
 void free_pinned_ptr(uintptr_t ptr) {
-  cudaError_t err = cudaFreeHost(reinterpret_cast<void*>(ptr));
-  if (err != cudaSuccess) {
-    throw std::runtime_error("cudaFreeHost failed: " + std::to_string(err));
+  void* p = reinterpret_cast<void*>(ptr);
+
+  // Check if this allocation used the mmap fallback path.
+  size_t mmap_size = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_fallback_mtx);
+    auto it = g_fallback_allocs.find(ptr);
+    if (it != g_fallback_allocs.end()) {
+      mmap_size = it->second;
+      g_fallback_allocs.erase(it);
+    }
+  }
+
+  if (mmap_size > 0) {
+    // Fallback path: unregister the pinned region, then release the mapping.
+    cudaError_t err = cudaHostUnregister(p);
+    if (err != cudaSuccess) {
+      (void)cudaGetLastError();
+      // Continue to munmap even if unregister fails.
+    }
+    if (munmap(p, mmap_size) != 0) {
+      throw std::runtime_error(
+          std::string("free_pinned_ptr munmap failed: ") + strerror(errno));
+    }
+  } else {
+    // Standard path: memory was allocated with cudaHostAlloc.
+    cudaError_t err = cudaFreeHost(p);
+    if (err != cudaSuccess) {
+      (void)cudaGetLastError();
+      throw std::runtime_error(
+          std::string("cudaFreeHost failed: ") + cudaGetErrorString(err));
+    }
   }
 }
 
@@ -74,6 +144,7 @@ uintptr_t alloc_pinned_numa_ptr(size_t size, int node) {
 
   cudaError_t st = cudaHostRegister(ptr, size, 0);
   if (st != cudaSuccess) {
+    (void)cudaGetLastError();
     munmap(ptr, size);
     throw std::runtime_error(std::string("cudaHostRegister failed: ") +
                              cudaGetErrorString(st));
@@ -87,6 +158,7 @@ void free_pinned_numa_ptr(uintptr_t ptr, size_t size) {
   // Unpin first, then unmap.
   cudaError_t st = cudaHostUnregister(p);
   if (st != cudaSuccess) {
+    (void)cudaGetLastError();
     munmap(p, size);
     throw std::runtime_error(std::string("cudaHostUnregister failed: ") +
                              cudaGetErrorString(st));
@@ -120,6 +192,7 @@ uintptr_t alloc_shm_pinned_ptr(size_t size, const std::string& shm_name) {
 
   cudaError_t st = cudaHostRegister(ptr, size, 0);
   if (st != cudaSuccess) {
+    (void)cudaGetLastError();
     munmap(ptr, size);
     shm_unlink(shm_name.c_str());
     throw std::runtime_error(std::string("cudaHostRegister failed: ") +
@@ -134,6 +207,7 @@ void free_shm_pinned_ptr(uintptr_t ptr, size_t size,
   void* p = reinterpret_cast<void*>(ptr);
   cudaError_t st = cudaHostUnregister(p);
   if (st != cudaSuccess) {
+    (void)cudaGetLastError();
     munmap(p, size);
     shm_unlink(shm_name.c_str());
     throw std::runtime_error(std::string("cudaHostUnregister failed: ") +
