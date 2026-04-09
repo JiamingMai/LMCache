@@ -12,10 +12,14 @@
 #include <linux/mempolicy.h>  // for MPOL_BIND, MPOL_MF_MOVE, MPOL_MF_STRICT
 #include "mem_alloc.h"
 
-// Track allocations that used the mmap + cudaHostRegister fallback path
-// so free_pinned_ptr can choose the correct deallocation method.
+// Track allocations that used the mmap fallback path (with or without
+// cudaHostRegister) so free_pinned_ptr can choose the correct deallocation.
 static std::mutex g_fallback_mtx;
-static std::unordered_map<uintptr_t, size_t> g_fallback_allocs;
+struct FallbackInfo {
+  size_t size;
+  bool pinned;  // true if cudaHostRegister succeeded
+};
+static std::unordered_map<uintptr_t, FallbackInfo> g_fallback_allocs;
 
 uintptr_t alloc_pinned_ptr(size_t size, unsigned int flags) {
   void* ptr = nullptr;
@@ -43,19 +47,26 @@ uintptr_t alloc_pinned_ptr(size_t size, unsigned int flags) {
     *c = 0;
   }
 
+  bool pinned = false;
   err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
-  if (err != cudaSuccess) {
+  if (err == cudaSuccess) {
+    pinned = true;
+  } else {
+    // cudaHostRegister can also fail on Blackwell under certain driver
+    // or process conditions.  Clear the error and continue with unpinned
+    // memory.  DMA transfers will fall back to synchronous copies, which
+    // is slower but fully functional.
     (void)cudaGetLastError();
-    munmap(ptr, size);
-    throw std::runtime_error(
-        std::string("alloc_pinned_ptr cudaHostRegister failed: ") +
-        cudaGetErrorString(err));
+    fprintf(stderr,
+            "LMCache WARNING: cudaHostRegister failed (%s), "
+            "continuing with unpinned memory\n",
+            cudaGetErrorString(err));
   }
 
   uintptr_t result = reinterpret_cast<uintptr_t>(ptr);
   {
     std::lock_guard<std::mutex> lk(g_fallback_mtx);
-    g_fallback_allocs[result] = size;
+    g_fallback_allocs[result] = {size, pinned};
   }
   return result;
 }
@@ -64,24 +75,25 @@ void free_pinned_ptr(uintptr_t ptr) {
   void* p = reinterpret_cast<void*>(ptr);
 
   // Check if this allocation used the mmap fallback path.
-  size_t mmap_size = 0;
+  FallbackInfo info = {0, false};
   {
     std::lock_guard<std::mutex> lk(g_fallback_mtx);
     auto it = g_fallback_allocs.find(ptr);
     if (it != g_fallback_allocs.end()) {
-      mmap_size = it->second;
+      info = it->second;
       g_fallback_allocs.erase(it);
     }
   }
 
-  if (mmap_size > 0) {
-    // Fallback path: unregister the pinned region, then release the mapping.
-    cudaError_t err = cudaHostUnregister(p);
-    if (err != cudaSuccess) {
-      (void)cudaGetLastError();
-      // Continue to munmap even if unregister fails.
+  if (info.size > 0) {
+    // Fallback path: unregister if pinned, then release the mapping.
+    if (info.pinned) {
+      cudaError_t err = cudaHostUnregister(p);
+      if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+      }
     }
-    if (munmap(p, mmap_size) != 0) {
+    if (munmap(p, info.size) != 0) {
       throw std::runtime_error(
           std::string("free_pinned_ptr munmap failed: ") + strerror(errno));
     }
