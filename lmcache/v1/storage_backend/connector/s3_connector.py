@@ -82,6 +82,7 @@ class S3Connector(RemoteConnector):
         disable_tls: bool,
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
+        s3_bucket: Optional[str] = None,
     ):
         # initialize base class, which includes some common attributes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -92,6 +93,7 @@ class S3Connector(RemoteConnector):
         self.s3_part_size = self.full_chunk_size_bytes
 
         self.s3_endpoint = s3_endpoint.removeprefix("s3://")
+        self.s3_bucket = s3_bucket
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
@@ -167,12 +169,16 @@ class S3Connector(RemoteConnector):
         self.pq_executor = AsyncPQExecutor(loop)
 
     def _format_safe_path(self, key_str: str) -> str:
-        """
-        Generate a safe HTTP path for the S3 key.
+        """Generate a safe HTTP path for the S3 key.
+
         Flattens the key by replacing slashes with underscores and URL-encodes
-        any special characters.
+        any special characters.  When ``s3_bucket`` is set (path-style access
+        for S3-compatible services such as MinIO), the bucket name is prepended
+        to the path.
         """
         flat_key_str = key_str.replace("/", "_")
+        if self.s3_bucket:
+            return "/" + self.s3_bucket + "/" + url_quote(flat_key_str)
         return "/" + url_quote(flat_key_str)
 
     # TODO(Jiayi): optimize this with async
