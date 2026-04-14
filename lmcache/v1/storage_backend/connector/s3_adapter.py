@@ -39,6 +39,9 @@ class S3ConnectorAdapter(ConnectorAdapter):
         self.aws_access_key_id = extra_config.get("aws_access_key_id", None)
         self.aws_secret_access_key = extra_config.get("aws_secret_access_key", None)
         self.s3_bucket = extra_config.get("s3_bucket", None)
+        self.s3_disable_multipart = bool(
+            extra_config.get("s3_disable_multipart", False)
+        )
         if context.metadata is None:
             raise ValueError("metadata is required for S3Connector")
 
@@ -58,4 +61,5 @@ class S3ConnectorAdapter(ConnectorAdapter):
             aws_access_key_id=self.aws_access_key_id,
             aws_secret_access_key=self.aws_secret_access_key,
             s3_bucket=self.s3_bucket,
+            s3_disable_multipart=self.s3_disable_multipart,
         )

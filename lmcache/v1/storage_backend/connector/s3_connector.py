@@ -83,6 +83,7 @@ class S3Connector(RemoteConnector):
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
         s3_bucket: Optional[str] = None,
+        s3_disable_multipart: bool = False,
     ):
         # initialize base class, which includes some common attributes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -94,6 +95,7 @@ class S3Connector(RemoteConnector):
 
         self.s3_endpoint = s3_endpoint.removeprefix("s3://")
         self.s3_bucket = s3_bucket
+        self.s3_disable_multipart = s3_disable_multipart
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
@@ -144,6 +146,18 @@ class S3Connector(RemoteConnector):
         turn_off_tls = (
             s3.S3RequestTlsMode.DISABLED if disable_tls else s3.S3RequestTlsMode.ENABLED
         )
+        # When s3_disable_multipart is True, set the multipart threshold
+        # above the part size so the CRT client always uses a single PUT
+        # request.  This is needed for S3-compatible services (e.g. Alluxio)
+        # that do not implement CompleteMultipartUpload.
+        multipart_threshold = None
+        if s3_disable_multipart:
+            multipart_threshold = self.s3_part_size * 2
+            logger.info(
+                "Multipart upload disabled: threshold set to %d bytes",
+                multipart_threshold,
+            )
+
         logger.info("Initializing S3 client")
         self.s3_client = s3.S3Client(
             bootstrap=client_bootstrap,
@@ -152,6 +166,8 @@ class S3Connector(RemoteConnector):
             tls_connection_options=tls_opts,
             tls_mode=turn_off_tls,
             signing_config=signing_config,
+            part_size=self.s3_part_size,
+            multipart_upload_threshold=multipart_threshold,
         )
 
         # TODO(Jiayi): We need to handle cache consistency issues in a systematic way
@@ -530,7 +546,7 @@ class S3Connector(RemoteConnector):
             if done["err"] or done["status"] not in (200, 201):
                 raise RuntimeError(f"Upload failed in S3Connector: {done}")
 
-        s3_req = s3.S3Request(
+        req_kwargs = dict(
             client=self.s3_client,
             type=s3.S3RequestType.PUT_OBJECT,
             request=req,
@@ -538,6 +554,10 @@ class S3Connector(RemoteConnector):
             region=self.s3_region,
             on_done=on_done,
         )
+        if self.s3_disable_multipart:
+            req_kwargs["multipart_upload_threshold"] = total_len + 1
+
+        s3_req = s3.S3Request(**req_kwargs)
         return s3_req
 
     async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj):
