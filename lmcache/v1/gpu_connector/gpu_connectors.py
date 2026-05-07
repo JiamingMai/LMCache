@@ -402,6 +402,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        # Ensure any prior work on the default stream (e.g. slot_mapping.to(device))
+        # is visible to load_stream before launching kernels.
+        self.load_stream.wait_stream(torch.cuda.default_stream(self.device))
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
@@ -599,6 +602,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        # Ensure any prior work on the default stream (e.g. slot_mapping.to(device))
+        # is visible to load_stream before launching kernels.
+        self.load_stream.wait_stream(torch.cuda.default_stream(self.device))
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)

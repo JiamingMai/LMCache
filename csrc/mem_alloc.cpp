@@ -52,15 +52,22 @@ uintptr_t alloc_pinned_ptr(size_t size, unsigned int flags) {
   if (err == cudaSuccess) {
     pinned = true;
   } else {
-    // cudaHostRegister can also fail on Blackwell under certain driver
-    // or process conditions.  Clear the error and continue with unpinned
-    // memory.  DMA transfers will fall back to synchronous copies, which
-    // is slower but fully functional.
+    // cudaHostRegister failed.  CUDA kernels (get_kernel_ptr) require
+    // pinned memory to obtain a device-accessible pointer via
+    // cudaHostGetDevicePointer.  Continuing with unpinned memory would
+    // cause illegal memory accesses later.  Release the mapping and
+    // propagate the error.
     (void)cudaGetLastError();
-    fprintf(stderr,
-            "LMCache WARNING: cudaHostRegister failed (%s), "
-            "continuing with unpinned memory\n",
-            cudaGetErrorString(err));
+    std::string msg =
+        std::string("alloc_pinned_ptr: cudaHostRegister failed (") +
+        cudaGetErrorString(err) +
+        "). Unable to pin host memory — CUDA kernels require pinned "
+        "memory for host-device transfers. This can happen on certain "
+        "GPU architectures (e.g. Blackwell) or when the pinned-memory "
+        "limit is exceeded. Try reducing max_local_cpu_size or check "
+        "driver configuration.";
+    munmap(ptr, size);
+    throw std::runtime_error(msg);
   }
 
   uintptr_t result = reinterpret_cast<uintptr_t>(ptr);
